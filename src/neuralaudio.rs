@@ -1,3 +1,4 @@
+#![allow(unused)]
 use std::os::raw::{c_float, c_int};
 use std::path::Path;
 

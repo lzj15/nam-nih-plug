@@ -1,6 +1,9 @@
 use biquad::*;
 use nih_plug::prelude::*;
-use std::sync::Arc;
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 mod neuralaudio;
 
 const BASS_FREQ: f32 = 500.0;
@@ -9,21 +12,16 @@ const TREBLE_FREQ: f32 = 3000.0;
 
 struct Nam {
     params: Arc<NamParams>,
-    amp: Option<neuralaudio::Model>,
-    temp_buffer: Vec<f32>,
+    model: Option<neuralaudio::Model>,
+    output_buffer: Vec<f32>,
     filters: Option<[DirectForm1<f32>; 3]>,
+    sender: Option<HeapProd<(neuralaudio::Model, PathBuf)>>,
+    receiver: Option<HeapCons<(neuralaudio::Model, PathBuf)>>,
+    file_picker_opened: bool,
 }
 
-/// The [`Params`] derive macro gathers all of the information needed for the wrapper to know about
-/// the plugin's parameters, persistent serializable fields, and nested parameter groups. You can
-/// also easily implement [`Params`] by hand if you want to, for instance, have multiple instances
-/// of a parameters struct for multiple identical oscillators/filters/envelopes.
 #[derive(Params)]
 struct NamParams {
-    /// The parameter's ID is used to identify the parameter in the wrapped plugin API. As long as
-    /// these IDs remain constant, you can rename and reorder these fields as you wish. The
-    /// parameters are exposed to the host in the same order they were defined. In this case, this
-    /// gain parameter is stored as linear gain while the values are displayed in decibels.
     #[id = "bass"]
     pub bass: FloatParam,
     #[id = "mid"]
@@ -32,15 +30,25 @@ struct NamParams {
     pub treble: FloatParam,
     #[id = "output"]
     pub output: FloatParam,
+    #[id = "load-model"]
+    pub load_model: BoolParam,
+    #[persist = "model-path"]
+    pub model_path: Mutex<PathBuf>,
 }
 
 impl Default for Nam {
     fn default() -> Self {
+        let rb = HeapRb::<(neuralaudio::Model, PathBuf)>::new(2);
+        let (prod, cons) = rb.split();
+
         Self {
             params: Arc::new(NamParams::default()),
-            amp: None,
-            temp_buffer: Vec::new(),
+            model: None,
+            output_buffer: Vec::new(),
             filters: None,
+            sender: Some(prod),
+            receiver: Some(cons),
+            file_picker_opened: false,
         }
     }
 }
@@ -78,76 +86,49 @@ impl Default for NamParams {
             )
             .with_unit(" dB"),
 
-            // This gain is stored as linear gain. NIH-plug comes with useful conversion functions
-            // to treat these kinds of parameters as if we were dealing with decibels. Storing this
-            // as decibels is easier to work with, but requires a conversion for every sample.
             output: FloatParam::new(
                 "Output",
                 util::db_to_gain(0.0),
                 FloatRange::Skewed {
                     min: util::db_to_gain(-20.0),
                     max: util::db_to_gain(20.0),
-                    // This makes the range appear as if it was linear when displaying the values as
-                    // decibels
                     factor: FloatRange::gain_skew_factor(-20.0, 20.0),
                 },
             )
-            // Because the gain parameter is stored as linear gain instead of storing the value as
-            // decibels, we need logarithmic smoothing
             .with_smoother(SmoothingStyle::Logarithmic(50.0))
             .with_unit(" dB")
-            // There are many predefined formatters we can use here. If the gain was stored as
-            // decibels instead of as a linear gain value, we could have also used the
-            // `.with_step_size(0.1)` function to get internal rounding.
             .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
+
+            load_model: BoolParam::new("Open a NAM file", false),
+            model_path: Mutex::new(PathBuf::new()),
         }
     }
+}
+
+enum NamTask {
+    LoadModel,
 }
 
 impl Plugin for Nam {
     const NAME: &'static str = "NAM";
     const VENDOR: &'static str = "Zhijian Li";
-    // You can use `env!("CARGO_PKG_HOMEPAGE")` to reference the homepage field from the
-    // `Cargo.toml` file here
     const URL: &'static str = "https://codeberg.org/lzj15";
     const EMAIL: &'static str = "lzj15@proton.me";
-
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
-
-    // The first audio IO layout is used as the default. The other layouts may be selected either
-    // explicitly or automatically by the host or the user depending on the plugin API/backend.
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: NonZeroU32::new(2),
         main_output_channels: NonZeroU32::new(2),
         ..AudioIOLayout::const_default()
     }];
-
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
-    // Setting this to `true` will tell the wrapper to split the buffer up into smaller blocks
-    // whenever there are inter-buffer parameter changes. This way no changes to the plugin are
-    // required to support sample accurate automation and the wrapper handles all of the boring
-    // stuff like making sure transport and other timing information stays consistent between the
-    // splits.
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-
-    // If the plugin can send or receive SysEx messages, it can define a type to wrap around those
-    // messages here. The type implements the `SysExMessage` trait, which allows conversion to and
-    // from plain byte buffers.
     type SysExMessage = ();
-    // More advanced plugins can use this to run expensive background tasks. See the field's
-    // documentation for more information. `()` means that the plugin does not have any background
-    // tasks.
-    type BackgroundTask = ();
+    type BackgroundTask = NamTask;
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
-
-    // This plugin doesn't need any special initialization, but if you need to do anything expensive
-    // then this would be the place. State is kept around when the host reconfigures the
-    // plugin. If we do need special initialization, we could implement the `initialize()` and/or
-    // `reset()` methods
 
     fn initialize(
         &mut self,
@@ -155,14 +136,13 @@ impl Plugin for Nam {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.temp_buffer = Vec::with_capacity(buffer_config.max_buffer_size as usize);
+        self.output_buffer = Vec::with_capacity(buffer_config.max_buffer_size as usize);
 
-        self.amp = Some(
-            neuralaudio::Model::from_file(
-                "/home/lzj/Data/music/NAM/[AMP] PRS-MT100 LEAD Noon SM57 - STD.nam",
-            )
-            .expect("Failed to load model"),
-        );
+        let path = self.params.model_path.lock().unwrap().clone();
+        if path.exists() {
+            self.model = Some(neuralaudio::Model::from_file(&path).unwrap());
+            println!("Loaded {}", path.display());
+        }
 
         self.filters = Some([
             DirectForm1::<f32>::new(
@@ -202,13 +182,26 @@ impl Plugin for Nam {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        self.temp_buffer = vec![0.0; buffer.samples()];
-        self.temp_buffer
-            .copy_from_slice(buffer.as_slice_immutable()[0]);
-        self.amp
-            .as_mut()
-            .unwrap()
-            .process(self.temp_buffer.as_slice(), buffer.as_slice()[0]);
+        if self.params.load_model.value() && !self.file_picker_opened {
+            context.execute_background(NamTask::LoadModel);
+            self.file_picker_opened = true;
+        }
+        if self.params.load_model.value() == false {
+            self.file_picker_opened = false;
+        }
+
+        if let Some((model, path)) = self.receiver.as_mut().unwrap().try_pop() {
+            self.model = Some(model);
+            println!("Loaded {}", path.display());
+            *self.params.model_path.lock().unwrap() = path;
+        }
+
+        self.output_buffer.resize(buffer.samples(), 0.0);
+        if let Some(model) = self.model.as_mut() {
+            model.process(buffer.as_slice()[0], self.output_buffer.as_mut_slice());
+        } else {
+            self.output_buffer.copy_from_slice(buffer.as_slice()[0]);
+        }
 
         let coeffs_bass = Coefficients::from_params(
             Type::LowShelf(self.params.bass.value()),
@@ -236,23 +229,34 @@ impl Plugin for Nam {
             self.filters.as_mut().unwrap()[index].update_coefficients(*coeffs);
         }
 
-        for sample in buffer.as_slice()[0].as_mut() {
+        for sample in self.output_buffer.as_mut_slice() {
             for filter in self.filters.as_mut().unwrap() {
                 *sample = filter.run(*sample);
             }
-            // Smoothing is optionally built into the parameters themselves
             *sample *= self.params.output.smoothed.next();
         }
 
-        self.temp_buffer
-            .copy_from_slice(buffer.as_slice_immutable()[0]);
-        buffer.as_slice()[1].copy_from_slice(&self.temp_buffer);
+        buffer.as_slice()[0].copy_from_slice(&self.output_buffer);
+        buffer.as_slice()[1].copy_from_slice(&self.output_buffer);
 
         ProcessStatus::Normal
     }
 
-    // This can be used for cleaning up special resources like socket connections whenever the
-    // plugin is deactivated. Most plugins won't need to do anything here.
+    fn task_executor(&mut self) -> TaskExecutor<Self> {
+        let sender = Mutex::new(self.sender.take().unwrap());
+        return Box::new(move |task| match task {
+            NamTask::LoadModel => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("NAM", &["nam"])
+                    .pick_file()
+                {
+                    let model = neuralaudio::Model::from_file(path.clone()).unwrap();
+                    let _ = sender.lock().unwrap().try_push((model, path));
+                }
+            }
+        });
+    }
+
     fn deactivate(&mut self) {}
 }
 
