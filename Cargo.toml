@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 biquad = "0.5.0"
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
+rfd = "0.16.0"
+ringbuf = "0.4.8"
+vizia_plug = { git = "https://github.com/vizia/vizia-plug.git" }
 
 [build-dependencies]
 cc = "1.2.50"

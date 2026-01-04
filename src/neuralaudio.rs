@@ -1,3 +1,4 @@
+#![allow(unused)]
 use std::os::raw::{c_float, c_int};
 use std::path::Path;
 
@@ -102,3 +103,4 @@ pub fn set_default_max_audio_buffer_size(size: i32) {
 }
 
 unsafe impl Send for Model {}
+unsafe impl Sync for Model {}

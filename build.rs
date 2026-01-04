@@ -1,7 +1,6 @@
 fn main() {
     cc::Build::new()
         .cpp(true)
-        .std("c++20")
         .file("NeuralAudio/NeuralAudioCAPI/NeuralAudioCApi.cpp")
         .file("NeuralAudio/NeuralAudio/NeuralModel.cpp")
         .include("NeuralAudio/NeuralAudio")
